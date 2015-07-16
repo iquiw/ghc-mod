@@ -1,151 +1,182 @@
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;;
-;;; ghc-process.el
-;;;
+;;; ghc-process.el --- ghc-mod process control -*- lexical-binding: t -*-
 
-;; Author:  Kazu Yamamoto <Kazu@Mew.org>
+;; Author:  Kazu Yamamoto <Kazu@Mew.org>, Iku Iwasa <iku.iwasa@gmail.com>
 ;; Created: Mar  9, 2014
 
+;;; Commentary:
 ;;; Code:
-
 (require 'ghc-func)
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defvar ghc-process-running nil)
+(defconst ghc-command "ghc-mod")
 
 (defvar-local ghc-process-process-name nil)
-(defvar-local ghc-process-original-buffer nil)
-(defvar-local ghc-process-original-file nil)
-(defvar-local ghc-process-callback nil)
-(defvar-local ghc-process-hook nil
-  "Hook that will be called upon successfull completion of ghc-mod command.")
 
-(defvar ghc-command "ghc-mod")
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(ghc-defstruct cmd-callback cmd callback pre-hook post-hook)
 
 (defun ghc-get-project-root ()
+  "Return project root."
   (ghc-run-ghc-mod '("root")))
 
-(defun ghc-with-process (cmd callback &optional hook1 hook2)
+(defun ghc-with-process (cmd callback &optional pre-hook post-hook)
+  "Send CMD to `ghc-command' asynchronously and receive the result by CALLBACK.
+PRE-HOOK is called without argument before CMD is executed.
+POST-HOOK is called without argument after CMD returns OK result."
   (unless ghc-process-process-name
     (setq ghc-process-process-name (ghc-get-project-root)))
-  (if ghc-process-running
-    (error "ghc process already running")
-    (progn
-      (setq ghc-process-running t)
-      (if hook1 (funcall hook1))
-      (let* ((cbuf (current-buffer))
-             (name ghc-process-process-name)
-             (buf (get-buffer-create (concat " ghc-mod:" name)))
-             (file (buffer-file-name))
-             (cpro (get-process name)))
-        (ghc-with-current-buffer buf
-          (setq ghc-process-original-buffer cbuf)
-          (setq ghc-process-original-file file)
-          (setq ghc-process-callback callback)
-          (setq ghc-process-hook hook2)
+
+  (let* ((name ghc-process-process-name)
+         (buf (get-buffer-create (concat " ghc-mod:" name)))
+         (pro (ghc--get-process name buf)))
+    (with-current-buffer buf
+      (let ((empty (ghc--process-empty-cmd-callback-p pro)))
+        (ghc--process-push-cmd-callback pro cmd callback pre-hook post-hook)
+        (when empty
           (erase-buffer)
-          (let ((pro (ghc-get-process cpro name buf)))
-            (process-send-string pro cmd)
-            (when ghc-debug
-              (ghc-with-debug-buffer
-               (insert (format "%% %s" cmd))))
-            pro))))))
+          (ghc--process-send pro cmd)))
+      pro)))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defun ghc-sync-process (cmd &optional n post-hook)
+  "Send CMD to `ghc-command' synchronously.
+N is number of expected output list. (NOT USED)
+POST-HOOK is called without argument after CMD returns OK result."
+  (let (result data pro)
+    (setq pro (ghc-with-process cmd
+                                (lambda (r d) (setq result r data d))
+                                nil
+                                post-hook))
+    (condition-case nil
+        (while (null result)
+          (accept-process-output pro 1 nil t))
+      (quit nil))
+    (cond
+     ((eq result 'ok) data)
+     ((stringp data) (message "%s" data))
+     (t nil))))
 
-(defun ghc-get-process (cpro name buf)
-  (cond
-   ((not cpro)
-    (ghc-start-process name buf))
-   ((not (eq (process-status cpro) 'run))
-    (delete-process cpro)
-    (ghc-start-process name buf))
-   (t cpro)))
+(defun ghc--get-process (name buf)
+  "Return `ghc-command' process associated with NAME if it is alive.
+Otherwise, start `ghc-command' process with NAME and buffer BUF."
+  (let ((cpro (get-process name)))
+    (cond
+     ((not cpro)
+      (ghc--start-process name buf))
+     ((not (eq (process-status cpro) 'run))
+      (delete-process cpro)
+      (ghc--start-process name buf))
+     (t cpro))))
 
-(defun ghc-start-process (name buf)
-  (let* ((opts (append '("legacy-interactive" "-b" "\n" "-l" "-s") (ghc-make-ghc-options)))
-	 (pro (apply 'start-file-process name buf ghc-command opts)))
-    (set-process-filter pro 'ghc-process-filter)
-    (set-process-sentinel pro 'ghc-process-sentinel)
+(defun ghc--start-process (name buf)
+  "Start `ghc-command' with NAME and buffer BUF."
+  (let* ((opts (append '("legacy-interactive" "-b" "\n" "-l" "-s")
+                       (ghc-make-ghc-options)))
+         (pro (apply 'start-file-process name buf ghc-command opts)))
+    (set-process-filter pro 'ghc--process-filter)
+    (set-process-sentinel pro 'ghc--process-sentinel)
     (set-process-query-on-exit-flag pro nil)
     pro))
 
-(defun ghc-process-filter (process string)
-  (let ((pbuf (process-buffer process)))
-    (if (not (get-buffer pbuf))
-	(setq ghc-process-running nil) ;; just in case
-      (ghc-with-current-buffer (process-buffer process)
-        (goto-char (point-max))
-	(insert string)
-	(forward-line -1)
-	(cond
-	 ((looking-at "^OK$")
-	  (if ghc-process-hook (funcall ghc-process-hook))
-	  (goto-char (point-min))
-	  (funcall ghc-process-callback 'ok)
-	  (when ghc-debug
-	    (let ((cbuf (current-buffer)))
-	      (ghc-with-debug-buffer
-	       (insert-buffer-substring cbuf))))
-	  (setq ghc-process-running nil))
-	 ((looking-at "^NG ")
-	  (funcall ghc-process-callback 'ng)
-	  (when ghc-debug
-	    (let ((cbuf (current-buffer)))
-	      (ghc-with-debug-buffer
-	       (insert-buffer-substring cbuf))))
-	  (setq ghc-process-running nil)))))))
+(defun ghc--process-filter (process string)
+  "Pass PROCESS's output STRING to callback according to ok/ng result."
+  (when ghc-debug
+    (ghc-with-debug-buffer
+     (insert string)))
+  (with-current-buffer (process-buffer process)
+    (goto-char (point-max))
+    (insert string)
+    (forward-line -1)
+    (cond
+     ((looking-at "^OK$")
+      (goto-char (match-beginning 0))
+      (unless (bobp)
+        (backward-char))
+      (ghc--process-run-post-hook process)
+      (ghc--process-run-callback process 'ok (ghc--process-read-result)))
+     ((looking-at-p "^NG ")
+      (ghc--process-run-callback
+       process 'ng
+       (buffer-substring-no-properties (match-end 0) (point-max)))))))
 
-(defun ghc-process-sentinel (process event)
-  (setq ghc-process-running nil))
+(defun ghc--process-send (process cmd)
+  "Send to PROCESS CMD as input.  Write to debug buffer if necessary."
+  (when ghc-debug
+    (ghc-with-debug-buffer
+     (insert (format "%% %s" cmd))))
+  (ghc--process-run-pre-hook process)
+  (process-send-string process cmd))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defun ghc--process-read-result ()
+  "Read `ghc-command' result as Lisp object from the current buffer."
+  (let (result)
+    (while (member (char-before) '(?\) ?\"))
+      (backward-sexp)
+      (save-excursion
+        (let ((r (read (current-buffer))))
+          (push r result)))
+      (unless (bobp)
+        (backward-char)))
+    (if (= (length result) 1)
+        (car result)
+      result)))
 
-(defvar ghc-process-rendezvous nil)
-(defvar ghc-process-num-of-results nil)
-(defvar ghc-process-results nil)
+(defun ghc--process-sentinel (process event)
+  "Execute all callbacks of PROCESS with 'ng result.
+EVENT is passed as 2nd argument of callbacks."
+  (let ((queue (process-get process 'ghc-process-queue)))
+    (dolist (cmdcb queue)
+      (funcall (ghc-cmd-callback-get-callback cmdcb) 'ng event))))
 
-(defun ghc-sync-process (cmd &optional n hook)
-  (unless ghc-process-running
-    (setq ghc-process-rendezvous nil)
-    (setq ghc-process-results nil)
-    (setq ghc-process-num-of-results (or n 1))
-    (let ((pro (ghc-with-process cmd 'ghc-process-callback nil hook)))
-      ;; ghc-process-running is now t.
-      ;; But if the process exits abnormally, it is set to nil.
-      (condition-case nil
-	  (let ((inhibit-quit nil))
-	    (while (and (null ghc-process-rendezvous) ghc-process-running)
-	      (accept-process-output pro 0.1 nil t)))
-	(quit
-	 (setq ghc-process-running nil))))
-    ghc-process-results))
+(defun ghc--process-run-pre-hook (process)
+  "Run PROCESS's current pre-hook if it exists."
+  (let* ((queue (process-get process 'ghc-process-queue))
+         (pre-hook (ghc-cmd-callback-get-pre-hook (car queue))))
+    (when pre-hook
+      (funcall pre-hook))))
 
-(defun ghc-process-callback (status)
-  (cond
-   ((eq status 'ok)
-    (let* ((n ghc-process-num-of-results)
-	   (ret (if (= n 1)
-		    (ghc-read-lisp-this-buffer)
-		  (ghc-read-lisp-list-this-buffer n))))
-      (setq ghc-process-results ret)))
-   (t
-    (setq ghc-process-results nil)))
-  (setq ghc-process-num-of-results nil)
-  (setq ghc-process-rendezvous t))
+(defun ghc--process-run-post-hook (process)
+  "Run PROCESS's current post-hook if it exists."
+  (let* ((queue (process-get process 'ghc-process-queue))
+         (post-hook (ghc-cmd-callback-get-post-hook (car queue))))
+    (when post-hook
+      (funcall post-hook))))
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(defun ghc--process-run-callback (process result data)
+  "Run PROCESS's current callback with PROCESS, RESULT and DATA.
+Send next command if callback queue is not empty."
+  (erase-buffer)
+  (let* ((queue (process-get process 'ghc-process-queue))
+         (callback (ghc-cmd-callback-get-callback (car queue)))
+         (new-queue (cdr queue)))
+    (prog1
+        (when callback
+          (funcall callback result data))
+      (process-put process 'ghc-process-queue new-queue)
+      (when new-queue
+        (ghc--process-send process
+                           (ghc-cmd-callback-get-cmd (car new-queue)))))))
+
+(defun ghc--process-push-cmd-callback (process cmd callback pre-hook post-hook)
+  "Push to PROCESS's callback queue of CMD, CALLBACK, PRE-HOOK and POST-HOOK."
+  (let ((queue (process-get process 'ghc-process-queue))
+        (cmdcb (ghc-make-cmd-callback
+                :cmd cmd
+                :callback callback
+                :pre-hook pre-hook
+                :post-hook post-hook)))
+    (process-put process 'ghc-process-queue (push cmdcb queue))))
+
+(defun ghc--process-empty-cmd-callback-p (process)
+  "Return non-nill if PROCESS's callback queue is empty."
+  (null (process-get process 'ghc-process-queue)))
 
 (defun ghc-kill-process ()
+  "Kill ghc-mod process associated to the buffer."
   (interactive)
   (let* ((name ghc-process-process-name)
-	 (cpro (if name (get-process name))))
+         (cpro (if name (get-process name))))
     (if (not cpro)
-	(message "No process")
+        (message "No process")
       (delete-process cpro)
       (message "A process was killed"))))
 
 (provide 'ghc-process)
+;;; ghc-process.el ends here

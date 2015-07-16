@@ -1,3 +1,4 @@
+;;; ghc-check.el --- ghc-mod type check and lint -*- lexical-binding: t -*-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;
 ;;; ghc-check.el
@@ -64,13 +65,11 @@ nil            does not display errors/warnings.
 
 (defun ghc-check-syntax ()
   (interactive)
-  ;; Only check syntax of visible buffers
-  (when (get-buffer-window (current-buffer) t)
-    (with-timeout
-        (10 (error "ghc process may have hung or exited with an error"))
-      (while ghc-process-running (sleep-for 0.1)))
+  (let ((buf (current-buffer))
+        (file (buffer-file-name)))
     (ghc-with-process (ghc-check-send)
-                      'ghc-check-callback
+                      (lambda (status errs)
+                        (funcall #'ghc-check-callback buf file status errs))
                       (lambda () (setq mode-line-process " -:-")))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -92,20 +91,17 @@ nil            does not display errors/warnings.
 	    (mapconcat (lambda (x) (concat "\"" x "\"")) los ", ")
 	    "]")))
 
-(defun ghc-check-callback (status)
+(defun ghc-check-callback (buf file status errs)
   (cond
    ((eq status 'ok)
-    (let* ((errs (ghc-read-lisp-this-buffer))
-	   (infos (ghc-to-info errs)))
+    (let ((infos (ghc-to-info errs)))
       (cond
        (infos
-	(let ((file ghc-process-original-file)
-	      (buf ghc-process-original-buffer))
-	  (ghc-check-highlight-original-buffer file buf infos)))
+	(ghc-check-highlight-original-buffer file buf infos))
        (t
-	(ghc-with-current-buffer ghc-process-original-buffer
+	(ghc-with-current-buffer buf
 	  (remove-overlays (point-min) (point-max) 'ghc-check t))))
-      (ghc-with-current-buffer ghc-process-original-buffer
+      (ghc-with-current-buffer buf
 	(let ((len (length infos)))
 	  (if (= len 0)
 	      (setq mode-line-process "")
@@ -115,19 +111,16 @@ nil            does not display errors/warnings.
 	      (setq mode-line-process (format " %d:%d" elen wlen)))))
 	(force-mode-line-update))))
    (t
-    (let* ((err (ghc-unescape-string (buffer-substring-no-properties (+ (point) 3) (point-max))))
-	   (info (ghc-make-hilit-info
+    (let* ((info (ghc-make-hilit-info
 		  :file "Fail errors:"
 		  :line 0
 		  :coln 0
-		  :msg  err
+		  :msg  (or errs "Unknown error")
 		  :err  t
 		  :hole nil))
-	   (infos (list info))
-	   (file ghc-process-original-file)
-	   (buf ghc-process-original-buffer))
+	   (infos (list info)))
       (ghc-check-highlight-original-buffer file buf infos))
-    (ghc-with-current-buffer ghc-process-original-buffer
+    (ghc-with-current-buffer buf
       (setq mode-line-process " failed")
       (force-mode-line-update)))))
 
