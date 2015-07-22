@@ -50,7 +50,7 @@ POST-HOOK is called without argument after CMD returns OK result."
       (quit nil))
     (cond
      ((eq result 'ok) data)
-     ((stringp data) (message "%s" data))
+     ((stringp data) (message "%s" data) nil)
      (t nil))))
 
 (defun ghc--get-process (name buf)
@@ -165,7 +165,7 @@ Send next command if callback queue is not empty."
     (process-put process 'ghc-process-queue (push cmdcb queue))))
 
 (defun ghc--process-empty-cmd-callback-p (process)
-  "Return non-nill if PROCESS's callback queue is empty."
+  "Return non-nil if PROCESS's callback queue is empty."
   (null (process-get process 'ghc-process-queue)))
 
 (defun ghc-kill-process ()
